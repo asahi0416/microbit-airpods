@@ -1,12 +1,13 @@
 /**
  * micro:bit v1 - AirPods Proximity Pairing (Bare-Metal NRF_RADIO BLE Advertiser)
  * 
- * 特徴:
- * - クールダウンなし（Aボタンを押したらいつでも即座に送信、押しっぱなしでも連続送信）
- * - AirPodsのモデルID（AirPods 1/2/3, Pro 1/2, Max の全6種）、MACアドレス、
- *   個体識別子・バッテリー状態をハードウェア乱数生成器(NRF_RNG)で毎回完全ランダム生成
- * - micro:bit v1 の5x5全25個LEDマトリクス（ROW1〜3: 26,27,28 / COL1〜9）を正確に制御し、
- *   送信中は全LEDが明るく点灯・点滅して視覚的にすぐわかる設計
+ * 改善点 (PDCA対応):
+ * 1. ペイロードのステータス・マジックバイト (0x75, 0xaa, 0x30, 0x01 ... 0x45, 0x12, 0x12, 0x12) を
+ *    AppleJuiceの実績ある正規フォーマットに固定し、不正値でiOSに弾かれる問題を解消
+ * 2. Aボタンを押すごとに「送信元MACアドレス(6B)」と「AirPodsモデルID(6種)」をランダム生成し、
+ *    送信中の2.5秒間は途中でIDを変えずに15ms間隔で高密度送信することでiOSの認識率を最大化
+ * 3. PDUタイプを ADV_IND (0x40: 接続可能アドバタイズ) に設定し、iOSのペアリング検知感度を向上
+ * 4. クールダウンなし、送信中は5x5全25個のLEDが高速点滅
  */
 
 #include <Arduino.h>
@@ -19,7 +20,7 @@ const int PIN_BTN_A = 5; // Aボタン (P0.17, プルアップ, 押下時LOW)
 const int LED_ROWS[3] = {26, 27, 28};                     // ROW1(P0.13), ROW2(P0.14), ROW3(P0.15)
 const int LED_COLS[9] = {3, 4, 10, 23, 24, 25, 9, 7, 6};  // COL1〜COL9
 
-// AirPods モデル識別子一覧 (6種類)
+// AirPods モデル識別子一覧 (全6種類)
 const uint8_t AIRPODS_MODELS[6][2] = {
   {0x02, 0x20}, // AirPods (第1世代)
   {0x0f, 0x20}, // AirPods (第2世代)
@@ -29,13 +30,22 @@ const uint8_t AIRPODS_MODELS[6][2] = {
   {0x0a, 0x20}  // AirPods Max
 };
 
+// Apple Continuity Proximity Pairing 正規テンプレート (31バイト)
+// ※ Byte 7, 8 にモデルIDが入る
+const uint8_t AIRPODS_TEMPLATE[31] = {
+  0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07,
+  0x0e, 0x20, // [7],[8]: Model ID (動的にランダム書き換え)
+  0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+  0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
 // BLE PDU バッファ (4バイト境界アラインメント必須)
-// [0]: Header S0 (1B), [1]: Length (1B), [2..7]: AdvA MAC (6B), [8..38]: AdvData (31B)
 static uint8_t ble_pdu[40] __attribute__((aligned(4)));
 
-// 1回のボタン押下での最低送信時間 (ミリ秒) ※クールダウンは0秒
-const unsigned long BURST_DURATION_MS = 1500;
-const unsigned long ADV_INTERVAL_MS   = 20;
+// 1回のボタン押下での送信時間 (iOSが確実に検知できるよう2.5秒間同一IDを維持して連射)
+const unsigned long BURST_DURATION_MS = 2500;
+const unsigned long ADV_INTERVAL_MS   = 15; // 15ms間隔の高密度送信
 
 // 5x5 全25個のLEDを一括ON/OFF
 void setAllLeds(bool on) {
@@ -67,7 +77,7 @@ void initBleRadio() {
   NRF_RADIO->TASKS_DISABLE = 1;
   delayMicroseconds(100);
 
-  // 送信出力: +4dBm (最大出力)
+  // 送信出力: +4dBm (nRF51822 ハードウェア最大出力)
   NRF_RADIO->TXPOWER = (RADIO_TXPOWER_TXPOWER_Pos4dBm << RADIO_TXPOWER_TXPOWER_Pos);
 
   // モード: BLE 1Mbit
@@ -100,45 +110,27 @@ void initBleRadio() {
   NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
 }
 
-// 毎回ランダムなMACアドレス・AirPodsモデル・識別子でBLE PDUを組み立てる
+// ボタンを押すたびに新しいランダムMACアドレス＆ランダムAirPodsモデルでPDUを構築
 void buildRandomAirPodsPdu() {
-  // Byte 0: PDU Type = ADV_NONCONN_IND (0x02) | TxAdd = Random (0x40) -> 0x42
-  ble_pdu[0] = 0x42;
+  // Byte 0: PDU Type = ADV_IND (0x00: 接続可能アドバタイズ) | TxAdd = Random (0x40) -> 0x40
+  ble_pdu[0] = 0x40;
 
   // Byte 1: Payload Length = 6 (MAC) + 31 (AdvData) = 37 bytes
   ble_pdu[1] = 37;
 
-  // Byte 2..7: ランダムな送信元BLE MACアドレス (6バイト)
+  // Byte 2..7: ランダムな送信元BLE MACアドレス (6バイト: ハードウェアアドレス)
   for (int i = 0; i < 6; i++) {
     ble_pdu[2 + i] = getRandomByte();
   }
   ble_pdu[7] |= 0xC0; // Static Random Address 規格 (最上位2ビット = 11)
 
-  // AirPods モデルを6種類からランダム選択
-  uint8_t modelIdx = getRandomByte() % 6;
-
-  // Byte 8..38: Apple Continuity Proximity Pairing Payload (31バイト)
+  // Byte 8..38: 正規テンプレートをコピーした上でモデルIDをランダム選択
   uint8_t *adv = &ble_pdu[8];
-  adv[0]  = 0x1e;                         // Length: 30 bytes
-  adv[1]  = 0xff;                         // AD Type: Manufacturer Specific Data
-  adv[2]  = 0x4c;                         // Apple Company ID (Low)
-  adv[3]  = 0x00;                         // Apple Company ID (High)
-  adv[4]  = 0x07;                         // Continuity Type: Proximity Pairing (0x07)
-  adv[5]  = 0x19;                         // Continuity Length: 25 bytes
-  adv[6]  = 0x07;                         // Prefix
-  adv[7]  = AIRPODS_MODELS[modelIdx][0];  // ランダム選択されたAirPodsモデルID (1)
-  adv[8]  = AIRPODS_MODELS[modelIdx][1];  // ランダム選択されたAirPodsモデルID (2)
-  adv[9]  = 0x75;                         // Status (Pairing mode)
-  adv[10] = 0xaa;                         // Battery / Charging flags
-  adv[11] = (getRandomByte() & 0x7F);     // ランダムなバッテリー残量/状態
-  adv[12] = 0x01;                         // Lid open counter / flag
-  adv[13] = 0x00;                         // Color (0x00 = White)
-  adv[14] = 0x00;
+  memcpy(adv, AIRPODS_TEMPLATE, 31);
 
-  // Byte 15..30 (16バイト): 個体識別・暗号化ハッシュ領域を毎回ランダム化
-  for (int i = 15; i < 31; i++) {
-    adv[i] = getRandomByte();
-  }
+  uint8_t modelIdx = getRandomByte() % 6;
+  adv[7] = AIRPODS_MODELS[modelIdx][0];
+  adv[8] = AIRPODS_MODELS[modelIdx][1];
 }
 
 // BLE Advertising Channels (37, 38, 39) で1回ずつパケットを送信
@@ -157,16 +149,15 @@ void transmitBleAdvOnce() {
     while (NRF_RADIO->EVENTS_DISABLED == 0) {
       // 送信完了まで待機
     }
+    delayMicroseconds(150); // チャンネル間の微小ガードタイム
   }
 }
 
 void setup() {
   Serial.begin(115200);
 
-  // Aボタン初期化
   pinMode(PIN_BTN_A, INPUT);
 
-  // 5x5 全LEDピンをOUTPUTに初期化
   for (int r = 0; r < 3; r++) {
     pinMode(LED_ROWS[r], OUTPUT);
   }
@@ -174,7 +165,7 @@ void setup() {
     pinMode(LED_COLS[c], OUTPUT);
   }
 
-  // 起動確認のため全LEDを2回キラッと点滅させる
+  // 起動確認のため全LEDを2回点滅
   for (int i = 0; i < 2; i++) {
     setAllLeds(true);
     delay(150);
@@ -185,45 +176,34 @@ void setup() {
   initBleRadio();
 
   Serial.println(F("========================================"));
-  Serial.println(F("micro:bit v1 AirPods Random BLE Notifier"));
-  Serial.println(F("No cooldown / Full random ID / Full LED"));
+  Serial.println(F("micro:bit v1 AirPods BLE Notifier v3"));
   Serial.println(F("========================================"));
 }
 
 void loop() {
-  // Aボタンが押されたら即座に送信（クールダウンなし）
+  // Aボタンが押されたら即座に送信開始（クールダウンなし）
   if (digitalRead(PIN_BTN_A) == LOW) {
-    Serial.println(F("[BLE] Sending Random AirPods Notification..."));
-
-    // ランダムなAirPodsモデル・MACアドレス・識別子を構築
+    // 今回の送信セッション用のランダムMACアドレス＆ランダムAirPodsモデルを生成
     buildRandomAirPodsPdu();
 
-    // 送信開始: 全25個のLEDを点灯
     setAllLeds(true);
 
     unsigned long startTime = millis();
     int packetCount = 0;
 
-    // 最低1.5秒間（またはAボタンを押し続けている間）送信し続ける
-    while ((millis() - startTime < BURST_DURATION_MS) || (digitalRead(PIN_BTN_A) == LOW)) {
+    // 2.5秒間、同じ個体の電波を15ms間隔で高密度に維持してiOSに確実に認識させる
+    while (millis() - startTime < BURST_DURATION_MS) {
       transmitBleAdvOnce();
       packetCount++;
 
-      // 送信中であることがわかりやすいよう、約100ms(5回)ごとにLEDを高速点滅
-      if ((packetCount % 5) == 0) {
-        setAllLeds((packetCount / 5) % 2 == 0);
-      }
-
-      // ボタンを長押ししている場合は、500ms(25回)ごとに新しいランダムAirPods個体へ切り替える
-      if ((packetCount % 25) == 0) {
-        buildRandomAirPodsPdu();
+      // 約90ms(6回)ごとに全LEDを高速点滅
+      if ((packetCount % 6) == 0) {
+        setAllLeds((packetCount / 6) % 2 == 0);
       }
 
       delay(ADV_INTERVAL_MS);
     }
 
-    // 送信終了: 全LED消灯
     setAllLeds(false);
-    Serial.println(F("[BLE] Stopped. Ready immediately."));
   }
 }
